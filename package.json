@@ -1,0 +1,12 @@
+{
+  "name": "pi-nous",
+  "version": "1.0.0",
+  "description": "Nous Portal provider extension for pi",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
