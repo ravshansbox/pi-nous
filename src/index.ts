@@ -277,7 +277,10 @@ function supportsTextInput(live?: NousModelListResponse["data"][number]): boolea
     return input.split("+").includes("text");
   }
   const inputs = live?.modalities?.input || live?.architecture?.input_modalities;
-  return Array.isArray(inputs) ? inputs.includes("text") : false;
+  if (Array.isArray(inputs)) return inputs.includes("text");
+  // Fallback: most text models have "text" capability
+  const id = live?.id?.toLowerCase() || "";
+  return !/(image-only|vision-only|audio-only)/.test(id);
 }
 
 function supportsTextOutput(live?: NousModelListResponse["data"][number]): boolean {
@@ -287,11 +290,19 @@ function supportsTextOutput(live?: NousModelListResponse["data"][number]): boole
     return output.split("+").includes("text");
   }
   const outputs = live?.modalities?.output || live?.architecture?.output_modalities;
-  return Array.isArray(outputs) ? outputs.includes("text") : false;
+  if (Array.isArray(outputs)) return outputs.includes("text");
+  // Fallback: text output is universal for LLMs
+  return true;
 }
 
 function supportsToolCalling(live?: NousModelListResponse["data"][number]): boolean {
-  return Array.isArray(live?.supported_parameters) && live.supported_parameters.includes("tools");
+  // Check explicit supported_parameters first
+  if (Array.isArray(live?.supported_parameters) && live.supported_parameters.includes("tools")) {
+    return true;
+  }
+  // Fallback: infer tool support from model ID for known capable model families
+  const id = live?.id?.toLowerCase() || "";
+  return /^(openai\/gpt-|anthropic\/claude|google\/gemini|x-ai\/grok|qwen|stepfun|minimax|z-ai\/|xiaomi\/mimo|nvidia\/|moonshotai|arcee-ai)/.test(id);
 }
 
 function modelMeta(id: string, live?: NousModelListResponse["data"][number]): NousModel {
@@ -688,8 +699,13 @@ export default async function (pi: ExtensionAPI) {
         const c = credentials as NousCredentials;
         const baseUrl = safeBaseUrl(c.enterpriseUrl);
         const freeTier = c.metadata?.freeTier === true;
-        const filtered = freeTier ? partitionNousModelsByTier(currentModels as NousModel[], true).selectable : (currentModels as NousModel[]);
-        return filtered.map((m) => (m.provider === "nous" ? { ...m, baseUrl } : m));
+
+        return currentModels.flatMap((model) => {
+          const m = model as NousModel & { provider?: string; baseUrl?: string };
+          if (m.provider !== "nous") return [m];
+          if (freeTier && !isModelFree(m)) return [];
+          return [{ ...m, baseUrl }];
+        });
       },
     },
   });
