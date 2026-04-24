@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
@@ -41,6 +42,7 @@ const FALLBACK_MODELS = [
   "openai/gpt-5.4-nano",
 ] as const;
 
+
 type NousTokenResponse = {
   access_token: string;
   refresh_token?: string;
@@ -50,6 +52,17 @@ type NousTokenResponse = {
   inference_base_url?: string;
   error?: string;
   error_description?: string;
+};
+
+type NousModel = {
+  id: string;
+  name: string;
+  reasoning: boolean;
+  input: ("text" | "image")[];
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  contextWindow: number;
+  maxTokens: number;
+  compat: Record<string, unknown>;
 };
 
 type NousDeviceCodeResponse = {
@@ -70,16 +83,40 @@ type NousAgentKeyResponse = {
   inference_base_url?: string;
 };
 
+type NousModelListResponse = {
+  data?: Array<{
+    id?: string;
+    pricing?: {
+      prompt?: number | string;
+      completion?: number | string;
+      cache_read?: number | string;
+      cache_write?: number | string;
+      input_cache_read?: number | string;
+      input_cache_write?: number | string;
+    };
+    modalities?: { input?: string[]; output?: string[] };
+    architecture?: { modality?: string; input_modalities?: string[]; output_modalities?: string[] };
+    context_window?: number;
+    context_length?: number;
+    max_output_tokens?: number;
+    top_provider?: { max_completion_tokens?: number; context_length?: number };
+    supported_parameters?: string[];
+  }>;
+};
+
 type NousCredentials = OAuthCredentials & {
   enterpriseUrl?: string;
   metadata?: {
     refreshToken?: string;
     tokenType?: string;
     scope?: string;
+    oauthAccessToken?: string;
+    oauthAccessExpiresAt?: number;
     agentKey?: string;
     agentKeyExpiresAt?: string;
-    agentKeyExpiresIn?: number;
     keyId?: string;
+    freeTier?: boolean;
+    freeTierCheckedAt?: number;
   };
 };
 
@@ -126,6 +163,11 @@ function getScope(credentials: OAuthCredentials): string {
   return c.metadata?.scope || NOUS_SCOPE;
 }
 
+function getOAuthAccessToken(credentials: OAuthCredentials): string {
+  const c = credentials as NousCredentials;
+  return c.metadata?.oauthAccessToken || credentials.access || "";
+}
+
 function getAgentKey(credentials: OAuthCredentials): string {
   const c = credentials as NousCredentials;
   return c.metadata?.agentKey || "";
@@ -133,46 +175,184 @@ function getAgentKey(credentials: OAuthCredentials): string {
 
 function getAgentKeyExpiryMs(credentials: OAuthCredentials): number | undefined {
   const c = credentials as NousCredentials;
-  const meta = c.metadata;
-  if (!meta) return undefined;
-  if (typeof meta.agentKeyExpiresIn === "number" && Number.isFinite(meta.agentKeyExpiresIn)) {
-    return nowMs() + meta.agentKeyExpiresIn * 1000;
-  }
-  return parseIsoToMs(meta.agentKeyExpiresAt);
+  return parseIsoToMs(c.metadata?.agentKeyExpiresAt);
 }
 
-function modelMeta(id: string) {
+function isModelFree(model: { cost?: { input?: number; output?: number } }): boolean {
+  return (model.cost?.input || 0) === 0 && (model.cost?.output || 0) === 0;
+}
+
+function partitionNousModelsByTier(models: NousModel[], freeTier: boolean): { selectable: NousModel[]; unavailable: NousModel[] } {
+  if (!freeTier) return { selectable: models, unavailable: [] };
+  const selectable: NousModel[] = [];
+  const unavailable: NousModel[] = [];
+  for (const model of models) {
+    if (isModelFree(model)) selectable.push(model);
+    else unavailable.push(model);
+  }
+  return { selectable, unavailable };
+}
+
+function toFiniteNumber(value: unknown): number | undefined {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function getCachedFreeTier(credentials: OAuthCredentials): boolean | undefined {
+  const c = credentials as NousCredentials;
+  const checkedAt = c.metadata?.freeTierCheckedAt;
+  if (typeof checkedAt !== "number" || !Number.isFinite(checkedAt)) return undefined;
+  if (nowMs() - checkedAt > 3 * 60 * 1000) return undefined;
+  return c.metadata?.freeTier;
+}
+
+async function fetchAccountInfo(accessToken: string): Promise<{ subscription?: { monthly_charge?: number | string; tier?: number | string } }> {
+  const response = await fetch(`${NOUS_PORTAL_URL}/api/oauth/account`, {
+    headers: authHeaders(accessToken),
+  });
+  if (!response.ok) throw new Error(`Nous account request failed: ${response.status}`);
+  return (await response.json()) as { subscription?: { monthly_charge?: number | string; tier?: number | string } };
+}
+
+async function loadPersistedNousCredentials(): Promise<NousCredentials | undefined> {
+  try {
+    const raw = await readFile(`${process.env.HOME}/.pi/agent/auth.json`, "utf8");
+    const parsed = JSON.parse(raw) as { nous?: NousCredentials };
+    if (!parsed.nous || parsed.nous.type !== "oauth") return undefined;
+    return parsed.nous;
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveStartupNousModels(): Promise<NousModel[]> {
+  const persisted = await loadPersistedNousCredentials();
+  if (!persisted) return fallbackModels();
+
+  const oauthAccessToken = getOAuthAccessToken(persisted);
+  const agentKey = getAgentKey(persisted) || persisted.access;
+  if (!oauthAccessToken || !agentKey) return fallbackModels();
+
+  const [account, liveModels] = await Promise.all([
+    fetchAccountInfo(oauthAccessToken),
+    fetchLiveModels(agentKey, safeBaseUrl(persisted.enterpriseUrl)),
+  ]);
+
+  const monthlyCharge = toFiniteNumber(account.subscription?.monthly_charge);
+  const tier = toFiniteNumber(account.subscription?.tier);
+  const freeTier = monthlyCharge === 0 || tier === 5;
+  return freeTier ? partitionNousModelsByTier(liveModels, true).selectable : liveModels;
+}
+
+async function annotateFreeTier(credentials: NousCredentials): Promise<NousCredentials> {
+  const cached = getCachedFreeTier(credentials);
+  if (typeof cached === "boolean") return credentials;
+
+  try {
+    const account = await fetchAccountInfo(getOAuthAccessToken(credentials));
+    const monthlyCharge = toFiniteNumber(account.subscription?.monthly_charge);
+    const tier = toFiniteNumber(account.subscription?.tier);
+    if (typeof monthlyCharge === "number" || typeof tier === "number") {
+      const freeTier = monthlyCharge === 0 || tier === 5;
+      return {
+        ...credentials,
+        metadata: {
+          ...credentials.metadata,
+          freeTier,
+          freeTierCheckedAt: nowMs(),
+        },
+      };
+    }
+  } catch {
+    return credentials;
+  }
+
+  return credentials;
+}
+
+function supportsTextInput(live?: NousModelListResponse["data"][number]): boolean {
+  const modality = live?.architecture?.modality;
+  if (typeof modality === "string" && modality.includes("->")) {
+    const [input] = modality.split("->", 1);
+    return input.split("+").includes("text");
+  }
+  const inputs = live?.modalities?.input || live?.architecture?.input_modalities;
+  return Array.isArray(inputs) ? inputs.includes("text") : false;
+}
+
+function supportsTextOutput(live?: NousModelListResponse["data"][number]): boolean {
+  const modality = live?.architecture?.modality;
+  if (typeof modality === "string" && modality.includes("->")) {
+    const [, output] = modality.split("->", 2);
+    return output.split("+").includes("text");
+  }
+  const outputs = live?.modalities?.output || live?.architecture?.output_modalities;
+  return Array.isArray(outputs) ? outputs.includes("text") : false;
+}
+
+function supportsToolCalling(live?: NousModelListResponse["data"][number]): boolean {
+  return Array.isArray(live?.supported_parameters) && live.supported_parameters.includes("tools");
+}
+
+function modelMeta(id: string, live?: NousModelListResponse["data"][number]): NousModel {
   const lower = id.toLowerCase();
-  const image = /(claude|gpt|gemini|grok|vision|vl|mimo-v2-omni|glm-5v)/.test(lower);
+  const liveInputs = live?.modalities?.input || live?.architecture?.input_modalities;
+  const image = Array.isArray(liveInputs) ? liveInputs.includes("image") : /(claude|gpt|gemini|grok|vision|vl|mimo-v2-omni|glm-5v)/.test(lower);
   const reasoning = /(opus|sonnet|gpt-5|codex|gemini|grok|reason|thinking)/.test(lower);
-  let contextWindow = 262144;
-  let maxTokens = 32768;
-  if (lower.includes("gemini")) {
-    contextWindow = 1048576;
-    maxTokens = 65536;
-  } else if (lower.includes("gpt-5")) {
-    contextWindow = 400000;
-  } else if (lower.includes("haiku")) {
-    maxTokens = 8192;
-    contextWindow = 200000;
-  } else if (lower.includes("sonnet") || lower.includes("opus")) {
-    contextWindow = 200000;
-    maxTokens = lower.includes("opus") ? 32000 : 16384;
+  let contextWindow = live?.context_window || live?.context_length || live?.top_provider?.context_length || 262144;
+  let maxTokens = live?.max_output_tokens || live?.top_provider?.max_completion_tokens || 32768;
+  if (!live?.context_window || !live?.max_output_tokens) {
+    if (lower.includes("gemini")) {
+      contextWindow = 1048576;
+      maxTokens = 65536;
+    } else if (lower.includes("gpt-5")) {
+      contextWindow = 400000;
+    } else if (lower.includes("haiku")) {
+      maxTokens = 8192;
+      contextWindow = 200000;
+    } else if (lower.includes("sonnet") || lower.includes("opus")) {
+      contextWindow = 200000;
+      maxTokens = lower.includes("opus") ? 32000 : 16384;
+    }
   }
 
   const compat: Record<string, unknown> = { supportsDeveloperRole: false };
-  if (lower.includes("gemini")) compat.supportsDeveloperRole = false;
+  const pricing = live?.pricing;
 
   return {
     id,
     name: id,
     reasoning,
     input: (image ? ["text", "image"] : ["text"]) as ("text" | "image")[],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    cost: {
+      input: toFiniteNumber(pricing?.prompt) || 0,
+      output: toFiniteNumber(pricing?.completion) || 0,
+      cacheRead: toFiniteNumber(pricing?.cache_read ?? pricing?.input_cache_read) || 0,
+      cacheWrite: toFiniteNumber(pricing?.cache_write ?? pricing?.input_cache_write) || 0,
+    },
     contextWindow,
     maxTokens,
     compat,
   };
+}
+
+async function fetchLiveModels(apiKey: string, baseUrl = NOUS_INFERENCE_URL): Promise<NousModel[]> {
+  const response = await fetch(`${safeBaseUrl(baseUrl)}/models`, {
+    headers: authHeaders(apiKey),
+  });
+  if (!response.ok) throw new Error(`Nous models request failed: ${response.status}`);
+
+  const payload = (await response.json()) as NousModelListResponse;
+  const models = (payload.data || [])
+    .filter((item) => item.id && !item.id.toLowerCase().includes("hermes"))
+    .filter((item) => supportsTextInput(item) && supportsTextOutput(item) && supportsToolCalling(item))
+    .map((item) => modelMeta(item.id!.trim(), item));
+
+  return models.length ? models : fallbackModels();
+}
+
+function fetchTierAwareModels(models: NousModel[], freeTier: boolean): { selectable: NousModel[]; unavailable: NousModel[] } {
+  return partitionNousModelsByTier(models, freeTier);
 }
 
 async function requestDeviceCode(): Promise<NousDeviceCodeResponse> {
@@ -305,15 +485,18 @@ async function refreshAccessToken(credentials: OAuthCredentials): Promise<NousCr
     throw new Error("Nous token refresh succeeded without access_token");
   }
 
+  const oauthExpiresAt = nowMs() + (data.expires_in || 3600) * 1000;
   return {
     refresh: data.refresh_token || refreshToken,
     access: data.access_token,
-    expires: nowMs() + (data.expires_in || 3600) * 1000,
+    expires: oauthExpiresAt,
     enterpriseUrl: safeBaseUrl(data.inference_base_url || (credentials as NousCredentials).enterpriseUrl),
     metadata: {
       refreshToken: data.refresh_token || refreshToken,
       tokenType: data.token_type || getTokenType(credentials),
       scope: data.scope || getScope(credentials),
+      oauthAccessToken: data.access_token,
+      oauthAccessExpiresAt: oauthExpiresAt,
     },
   };
 }
@@ -336,6 +519,8 @@ async function mintAgentKey(credentials: OAuthCredentials): Promise<NousCredenti
         refreshToken: getRefreshToken(baseCreds),
         tokenType: getTokenType(baseCreds),
         scope: getScope(baseCreds),
+        oauthAccessToken: getOAuthAccessToken(baseCreds),
+        oauthAccessExpiresAt: baseCreds.expires,
         agentKey: existingKey,
       },
     };
@@ -369,9 +554,10 @@ async function mintAgentKey(credentials: OAuthCredentials): Promise<NousCredenti
       refreshToken: getRefreshToken(baseCreds),
       tokenType: getTokenType(baseCreds),
       scope: getScope(baseCreds),
+      oauthAccessToken: getOAuthAccessToken(baseCreds),
+      oauthAccessExpiresAt: baseCreds.expires,
       agentKey: data.api_key,
       agentKeyExpiresAt: data.expires_at,
-      agentKeyExpiresIn: data.expires_in,
       keyId: data.key_id,
     },
   };
@@ -389,19 +575,31 @@ async function loginNous(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentia
     const token = await pollForToken(device, callbacks.signal);
     if (!token.access_token) throw new Error("Nous login did not return an access token");
 
+    const oauthExpiresAt = nowMs() + (token.expires_in || 3600) * 1000;
     const credentials: NousCredentials = {
       refresh: token.refresh_token || "",
       access: token.access_token,
-      expires: nowMs() + (token.expires_in || 3600) * 1000,
+      expires: oauthExpiresAt,
       enterpriseUrl: safeBaseUrl(token.inference_base_url),
       metadata: {
         refreshToken: token.refresh_token || "",
         tokenType: token.token_type || "Bearer",
         scope: token.scope || NOUS_SCOPE,
+        oauthAccessToken: token.access_token,
+        oauthAccessExpiresAt: oauthExpiresAt,
       },
     };
 
-    return await mintAgentKey(credentials);
+    const minted = await mintAgentKey(credentials);
+    const annotated = await annotateFreeTier(minted);
+    return {
+      ...annotated,
+      metadata: {
+        ...annotated.metadata,
+        oauthAccessToken: token.access_token,
+        oauthAccessExpiresAt: oauthExpiresAt,
+      },
+    };
   } catch (error) {
     if (!(error instanceof Error) || error.message !== "NOUS_VERCEL_CHECKPOINT") throw error;
 
@@ -438,7 +636,7 @@ async function loginNous(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentia
         scope: NOUS_SCOPE,
       },
     };
-    return await mintAgentKey(creds);
+    return await annotateFreeTier(await mintAgentKey(creds));
   }
 }
 
@@ -451,18 +649,8 @@ export default async function (pi: ExtensionAPI) {
 
   try {
     const envApiKey = process.env.NOUS_API_KEY?.trim();
-    if (envApiKey) {
-      const response = await fetch(`${NOUS_INFERENCE_URL}/models`, {
-        headers: authHeaders(envApiKey),
-      });
-      if (response.ok) {
-        const payload = (await response.json()) as { data?: Array<{ id?: string }> };
-        const ids = (payload.data || [])
-          .map((item) => item?.id?.trim())
-          .filter((id): id is string => Boolean(id && !id.toLowerCase().includes("hermes")));
-        if (ids.length) discoveredModels = [...new Set(ids)].map((id) => modelMeta(id));
-      }
-    }
+    if (envApiKey) discoveredModels = await fetchLiveModels(envApiKey);
+    else discoveredModels = await resolveStartupNousModels();
   } catch {
     // Keep fallback models. Runtime OAuth flow is the primary path.
   }
@@ -476,7 +664,16 @@ export default async function (pi: ExtensionAPI) {
       login: loginNous,
       refreshToken: async (credentials) => {
         const refreshed = await refreshAccessToken(credentials);
-        return mintAgentKey(refreshed);
+        const minted = await mintAgentKey(refreshed);
+        const annotated = await annotateFreeTier(minted);
+        return {
+          ...annotated,
+          metadata: {
+            ...annotated.metadata,
+            oauthAccessToken: refreshed.access,
+            oauthAccessExpiresAt: refreshed.expires,
+          },
+        };
       },
       getApiKey: (credentials) => {
         const c = credentials as NousCredentials;
@@ -488,8 +685,11 @@ export default async function (pi: ExtensionAPI) {
           : Array.isArray((models as { models?: unknown })?.models)
             ? ((models as { models: typeof discoveredModels }).models)
             : discoveredModels;
-        const baseUrl = safeBaseUrl((credentials as NousCredentials).enterpriseUrl);
-        return currentModels.map((m) => (m.provider === "nous" ? { ...m, baseUrl } : m));
+        const c = credentials as NousCredentials;
+        const baseUrl = safeBaseUrl(c.enterpriseUrl);
+        const freeTier = c.metadata?.freeTier === true;
+        const filtered = freeTier ? partitionNousModelsByTier(currentModels as NousModel[], true).selectable : (currentModels as NousModel[]);
+        return filtered.map((m) => (m.provider === "nous" ? { ...m, baseUrl } : m));
       },
     },
   });
