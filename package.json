@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "description": "Nous Portal provider extension for pi",
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
