@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { Api, Model, OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const NOUS_PORTAL_URL = "https://portal.nousresearch.com";
 const NOUS_INFERENCE_URL = "https://inference-api.nousresearch.com/v1";
@@ -83,26 +83,30 @@ type NousAgentKeyResponse = {
   inference_base_url?: string;
 };
 
-type NousModelListResponse = {
-  data?: Array<{
-    id?: string;
-    pricing?: {
-      prompt?: number | string;
-      completion?: number | string;
-      cache_read?: number | string;
-      cache_write?: number | string;
-      input_cache_read?: number | string;
-      input_cache_write?: number | string;
-    };
-    modalities?: { input?: string[]; output?: string[] };
-    architecture?: { modality?: string; input_modalities?: string[]; output_modalities?: string[] };
-    context_window?: number;
-    context_length?: number;
-    max_output_tokens?: number;
-    top_provider?: { max_completion_tokens?: number; context_length?: number };
-    supported_parameters?: string[];
-  }>;
+type NousModelListItem = {
+  id?: string;
+  pricing?: {
+    prompt?: number | string;
+    completion?: number | string;
+    cache_read?: number | string;
+    cache_write?: number | string;
+    input_cache_read?: number | string;
+    input_cache_write?: number | string;
+  };
+  modalities?: { input?: string[]; output?: string[] };
+  architecture?: { modality?: string; input_modalities?: string[]; output_modalities?: string[] };
+  context_window?: number;
+  context_length?: number;
+  max_output_tokens?: number;
+  top_provider?: { max_completion_tokens?: number; context_length?: number };
+  supported_parameters?: string[];
 };
+
+type NousModelListResponse = {
+  data?: NousModelListItem[];
+};
+
+type NousModelConfig = NousModel & Model<Api> & { provider?: string; baseUrl?: string };
 
 type NousCredentials = OAuthCredentials & {
   enterpriseUrl?: string;
@@ -270,7 +274,7 @@ async function annotateFreeTier(credentials: NousCredentials): Promise<NousCrede
   return credentials;
 }
 
-function supportsTextInput(live?: NousModelListResponse["data"][number]): boolean {
+function supportsTextInput(live?: NousModelListItem): boolean {
   const modality = live?.architecture?.modality;
   if (typeof modality === "string" && modality.includes("->")) {
     const [input] = modality.split("->", 1);
@@ -283,7 +287,7 @@ function supportsTextInput(live?: NousModelListResponse["data"][number]): boolea
   return !/(image-only|vision-only|audio-only)/.test(id);
 }
 
-function supportsTextOutput(live?: NousModelListResponse["data"][number]): boolean {
+function supportsTextOutput(live?: NousModelListItem): boolean {
   const modality = live?.architecture?.modality;
   if (typeof modality === "string" && modality.includes("->")) {
     const [, output] = modality.split("->", 2);
@@ -295,7 +299,7 @@ function supportsTextOutput(live?: NousModelListResponse["data"][number]): boole
   return true;
 }
 
-function supportsToolCalling(live?: NousModelListResponse["data"][number]): boolean {
+function supportsToolCalling(live?: NousModelListItem): boolean {
   // Check explicit supported_parameters first
   if (Array.isArray(live?.supported_parameters) && live.supported_parameters.includes("tools")) {
     return true;
@@ -305,7 +309,7 @@ function supportsToolCalling(live?: NousModelListResponse["data"][number]): bool
   return /^(openai\/gpt-|anthropic\/claude|google\/gemini|x-ai\/grok|qwen|stepfun|minimax|z-ai\/|xiaomi\/mimo|nvidia\/|moonshotai|arcee-ai)/.test(id);
 }
 
-function modelMeta(id: string, live?: NousModelListResponse["data"][number]): NousModel {
+function modelMeta(id: string, live?: NousModelListItem): NousModel {
   const lower = id.toLowerCase();
   const liveInputs = live?.modalities?.input || live?.architecture?.input_modalities;
   const image = Array.isArray(liveInputs) ? liveInputs.includes("image") : /(claude|gpt|gemini|grok|vision|vl|mimo-v2-omni|glm-5v)/.test(lower);
@@ -701,7 +705,7 @@ export default async function (pi: ExtensionAPI) {
         const freeTier = c.metadata?.freeTier === true;
 
         return currentModels.flatMap((model) => {
-          const m = model as NousModel & { provider?: string; baseUrl?: string };
+          const m = model as NousModelConfig;
           if (m.provider !== "nous") return [m];
           if (freeTier && !isModelFree(m)) return [];
           return [{ ...m, baseUrl }];
