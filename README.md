@@ -2,38 +2,23 @@
 
 Nous Portal provider extension for pi.
 
-## What it does
+## Install
 
-- Registers a `nous` provider for pi
-- Uses Nous Portal OAuth device flow
-- Refreshes OAuth tokens
-- Mints short-lived Nous inference agent keys
-- Uses the Nous inference API at `https://inference-api.nousresearch.com/v1`
-
-## Files
-
-- `index.ts` — extension entrypoint
-- `package.json` — pi package metadata
-
-## Use locally
-
-From this directory:
-
-```bash
-pi -e ./index.ts
+```json
+{
+  "extensions": ["github:ravshansbox/pi-nous"]
+}
 ```
 
-Or add the directory/package in pi config.
+## Usage
 
-## Install as local package
+Pi loads the provider from `./index.ts` and registers a `nous` provider backed by the Nous Portal OAuth flow and inference API.
 
-You can also reference it from your pi settings as a local extension/package path.
+For example, choose a Nous model in pi, sign in through the device-flow prompt, and the extension will mint an agent key before sending requests to `https://inference-api.nousresearch.com/v1`.
 
-## Notes
+## Development
 
-- Based on the working extension developed in `~/.pi/agent/extensions/nous-provider/`
-- Uses Hermes-like endpoints:
-  - `/api/oauth/device/code`
-  - `/api/oauth/token`
-  - `/api/oauth/agent-key`
-- Includes a manual fallback for Vercel browser checkpoint situations
+```bash
+npm install
+npm run typecheck
+```
