@@ -4,10 +4,8 @@ Nous Portal provider extension for pi.
 
 ## Install
 
-```json
-{
-  "extensions": ["github:ravshansbox/pi-nous"]
-}
+```bash
+pi install git:github.com/ravshansbox/pi-nous
 ```
 
 ## Usage
