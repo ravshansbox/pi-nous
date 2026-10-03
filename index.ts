@@ -1,10 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import type {
-  Api,
-  Model,
-  OAuthCredentials,
-  OAuthLoginCallbacks,
-} from '@earendil-works/pi-ai';
+import type { Api, Model, OAuthCredentials, OAuthLoginCallbacks } from '@earendil-works/pi-ai';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 
 const NOUS_PORTAL_URL = 'https://portal.nousresearch.com';
@@ -117,8 +112,7 @@ type NousModelListItem = {
 
 type NousModelListResponse = { data?: NousModelListItem[] };
 
-type NousModelConfig = NousModel &
-  Model<Api> & { provider?: string; baseUrl?: string };
+type NousModelConfig = NousModel & Model<Api> & { provider?: string; baseUrl?: string };
 
 type NousCredentials = OAuthCredentials & {
   enterpriseUrl?: string;
@@ -189,16 +183,12 @@ function getAgentKey(credentials: OAuthCredentials): string {
   return c.metadata?.agentKey || '';
 }
 
-function getAgentKeyExpiryMs(
-  credentials: OAuthCredentials,
-): number | undefined {
+function getAgentKeyExpiryMs(credentials: OAuthCredentials): number | undefined {
   const c = credentials as NousCredentials;
   return parseIsoToMs(c.metadata?.agentKeyExpiresAt);
 }
 
-function isModelFree(model: {
-  cost?: { input?: number; output?: number };
-}): boolean {
+function isModelFree(model: { cost?: { input?: number; output?: number } }): boolean {
   return (model.cost?.input || 0) === 0 && (model.cost?.output || 0) === 0;
 }
 
@@ -217,47 +207,33 @@ function partitionNousModelsByTier(
 }
 
 function toFiniteNumber(value: unknown): number | undefined {
-  const n =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string'
-        ? Number(value)
-        : NaN;
+  const n = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
   return Number.isFinite(n) ? n : undefined;
 }
 
 function getCachedFreeTier(credentials: OAuthCredentials): boolean | undefined {
   const c = credentials as NousCredentials;
   const checkedAt = c.metadata?.freeTierCheckedAt;
-  if (typeof checkedAt !== 'number' || !Number.isFinite(checkedAt))
-    return undefined;
+  if (typeof checkedAt !== 'number' || !Number.isFinite(checkedAt)) return undefined;
   if (nowMs() - checkedAt > 3 * 60 * 1000) return undefined;
   return c.metadata?.freeTier;
 }
 
-async function fetchAccountInfo(
-  accessToken: string,
-): Promise<{
+async function fetchAccountInfo(accessToken: string): Promise<{
   subscription?: { monthly_charge?: number | string; tier?: number | string };
 }> {
   const response = await fetch(`${NOUS_PORTAL_URL}/api/oauth/account`, {
     headers: authHeaders(accessToken),
   });
-  if (!response.ok)
-    throw new Error(`Nous account request failed: ${response.status}`);
+  if (!response.ok) throw new Error(`Nous account request failed: ${response.status}`);
   return (await response.json()) as {
     subscription?: { monthly_charge?: number | string; tier?: number | string };
   };
 }
 
-async function loadPersistedNousCredentials(): Promise<
-  NousCredentials | undefined
-> {
+async function loadPersistedNousCredentials(): Promise<NousCredentials | undefined> {
   try {
-    const raw = await readFile(
-      `${process.env['HOME']}/.pi/agent/auth.json`,
-      'utf8',
-    );
+    const raw = await readFile(`${process.env['HOME']}/.pi/agent/auth.json`, 'utf8');
     const parsed = JSON.parse(raw) as { nous?: NousCredentials };
     if (!parsed.nous || parsed.nous['type'] !== 'oauth') return undefined;
     return parsed.nous;
@@ -282,14 +258,10 @@ async function resolveStartupNousModels(): Promise<NousModel[]> {
   const monthlyCharge = toFiniteNumber(account.subscription?.monthly_charge);
   const tier = toFiniteNumber(account.subscription?.tier);
   const freeTier = monthlyCharge === 0 || tier === 5;
-  return freeTier
-    ? partitionNousModelsByTier(liveModels, true).selectable
-    : liveModels;
+  return freeTier ? partitionNousModelsByTier(liveModels, true).selectable : liveModels;
 }
 
-async function annotateFreeTier(
-  credentials: NousCredentials,
-): Promise<NousCredentials> {
+async function annotateFreeTier(credentials: NousCredentials): Promise<NousCredentials> {
   const cached = getCachedFreeTier(credentials);
   if (typeof cached === 'boolean') return credentials;
 
@@ -321,8 +293,7 @@ function supportsTextInput(live?: NousModelListItem): boolean {
     const [input] = modality.split('->', 1);
     return (input ?? '').split('+').includes('text');
   }
-  const inputs =
-    live?.modalities?.input || live?.architecture?.input_modalities;
+  const inputs = live?.modalities?.input || live?.architecture?.input_modalities;
   if (Array.isArray(inputs)) return inputs.includes('text');
   // Fallback: most text models have "text" capability
   const id = live?.id?.toLowerCase() || '';
@@ -335,8 +306,7 @@ function supportsTextOutput(live?: NousModelListItem): boolean {
     const [, output] = modality.split('->', 2);
     return (output ?? '').split('+').includes('text');
   }
-  const outputs =
-    live?.modalities?.output || live?.architecture?.output_modalities;
+  const outputs = live?.modalities?.output || live?.architecture?.output_modalities;
   if (Array.isArray(outputs)) return outputs.includes('text');
   // Fallback: text output is universal for LLMs
   return true;
@@ -344,10 +314,7 @@ function supportsTextOutput(live?: NousModelListItem): boolean {
 
 function supportsToolCalling(live?: NousModelListItem): boolean {
   // Check explicit supported_parameters first
-  if (
-    Array.isArray(live?.supported_parameters) &&
-    live.supported_parameters.includes('tools')
-  ) {
+  if (Array.isArray(live?.supported_parameters) && live.supported_parameters.includes('tools')) {
     return true;
   }
   // Fallback: infer tool support from model ID for known capable model families
@@ -359,22 +326,14 @@ function supportsToolCalling(live?: NousModelListItem): boolean {
 
 function modelMeta(id: string, live?: NousModelListItem): NousModel {
   const lower = id.toLowerCase();
-  const liveInputs =
-    live?.modalities?.input || live?.architecture?.input_modalities;
+  const liveInputs = live?.modalities?.input || live?.architecture?.input_modalities;
   const image = Array.isArray(liveInputs)
     ? liveInputs.includes('image')
     : /(claude|gpt|gemini|grok|vision|vl|mimo-v2-omni|glm-5v)/.test(lower);
-  const reasoning =
-    /(opus|sonnet|gpt-5|codex|gemini|grok|reason|thinking)/.test(lower);
+  const reasoning = /(opus|sonnet|gpt-5|codex|gemini|grok|reason|thinking)/.test(lower);
   let contextWindow =
-    live?.context_window ||
-    live?.context_length ||
-    live?.top_provider?.context_length ||
-    262144;
-  let maxTokens =
-    live?.max_output_tokens ||
-    live?.top_provider?.max_completion_tokens ||
-    32768;
+    live?.context_window || live?.context_length || live?.top_provider?.context_length || 262144;
+  let maxTokens = live?.max_output_tokens || live?.top_provider?.max_completion_tokens || 32768;
   if (!live?.context_window || !live?.max_output_tokens) {
     if (lower.includes('gemini')) {
       contextWindow = 1048576;
@@ -401,10 +360,8 @@ function modelMeta(id: string, live?: NousModelListItem): NousModel {
     cost: {
       input: toFiniteNumber(pricing?.prompt) || 0,
       output: toFiniteNumber(pricing?.completion) || 0,
-      cacheRead:
-        toFiniteNumber(pricing?.cache_read ?? pricing?.input_cache_read) || 0,
-      cacheWrite:
-        toFiniteNumber(pricing?.cache_write ?? pricing?.input_cache_write) || 0,
+      cacheRead: toFiniteNumber(pricing?.cache_read ?? pricing?.input_cache_read) || 0,
+      cacheWrite: toFiniteNumber(pricing?.cache_write ?? pricing?.input_cache_write) || 0,
     },
     contextWindow,
     maxTokens,
@@ -412,24 +369,17 @@ function modelMeta(id: string, live?: NousModelListItem): NousModel {
   };
 }
 
-async function fetchLiveModels(
-  apiKey: string,
-  baseUrl = NOUS_INFERENCE_URL,
-): Promise<NousModel[]> {
+async function fetchLiveModels(apiKey: string, baseUrl = NOUS_INFERENCE_URL): Promise<NousModel[]> {
   const response = await fetch(`${safeBaseUrl(baseUrl)}/models`, {
     headers: authHeaders(apiKey),
   });
-  if (!response.ok)
-    throw new Error(`Nous models request failed: ${response.status}`);
+  if (!response.ok) throw new Error(`Nous models request failed: ${response.status}`);
 
   const payload = (await response.json()) as NousModelListResponse;
   const models = (payload.data || [])
     .filter((item) => item.id && !item.id.toLowerCase().includes('hermes'))
     .filter(
-      (item) =>
-        supportsTextInput(item) &&
-        supportsTextOutput(item) &&
-        supportsToolCalling(item),
+      (item) => supportsTextInput(item) && supportsTextOutput(item) && supportsToolCalling(item),
     )
     .map((item) => modelMeta(item.id!.trim(), item));
 
@@ -440,9 +390,7 @@ function parseNousJson<T>(text: string, context: string): T {
   try {
     return JSON.parse(text) as T;
   } catch {
-    throw new Error(
-      `Nous ${context} returned a non-JSON response: ${text.slice(0, 200)}`,
-    );
+    throw new Error(`Nous ${context} returned a non-JSON response: ${text.slice(0, 200)}`);
   }
 }
 
@@ -466,20 +414,14 @@ async function requestDeviceCode(): Promise<NousDeviceCodeResponse> {
     const lower = text.toLowerCase();
     if (
       response.status === 429 &&
-      (lower.includes('vercel security checkpoint') ||
-        lower.includes('verifying your browser'))
+      (lower.includes('vercel security checkpoint') || lower.includes('verifying your browser'))
     ) {
       throw new Error('NOUS_VERCEL_CHECKPOINT');
     }
-    throw new Error(
-      `Nous device code request failed: ${response.status} ${text}`,
-    );
+    throw new Error(`Nous device code request failed: ${response.status} ${text}`);
   }
 
-  const data = parseNousJson<NousDeviceCodeResponse>(
-    text,
-    'device code request',
-  );
+  const data = parseNousJson<NousDeviceCodeResponse>(text, 'device code request');
   if (!data.device_code || !data.user_code || !data.verification_uri) {
     throw new Error('Nous device code response missing required fields');
   }
@@ -562,9 +504,7 @@ async function pollForToken(
   throw new Error('Nous login timed out.');
 }
 
-async function refreshAccessToken(
-  credentials: OAuthCredentials,
-): Promise<NousCredentials> {
+async function refreshAccessToken(credentials: OAuthCredentials): Promise<NousCredentials> {
   const refreshToken = getRefreshToken(credentials);
   if (!refreshToken) throw new Error('No Nous refresh token available');
 
@@ -611,9 +551,7 @@ async function refreshAccessToken(
   };
 }
 
-async function mintAgentKey(
-  credentials: OAuthCredentials,
-): Promise<NousCredentials> {
+async function mintAgentKey(credentials: OAuthCredentials): Promise<NousCredentials> {
   let baseCreds = credentials as NousCredentials;
   if (isExpiring(credentials.expires, ACCESS_REFRESH_SKEW_MS)) {
     baseCreds = await refreshAccessToken(credentials);
@@ -621,11 +559,7 @@ async function mintAgentKey(
 
   const existingKey = getAgentKey(baseCreds);
   const existingKeyExpiry = getAgentKeyExpiryMs(baseCreds);
-  if (
-    existingKey &&
-    existingKeyExpiry &&
-    !isExpiring(existingKeyExpiry, 60 * 1000)
-  ) {
+  if (existingKey && existingKeyExpiry && !isExpiring(existingKeyExpiry, 60 * 1000)) {
     return {
       ...baseCreds,
       access: existingKey,
@@ -664,9 +598,7 @@ async function mintAgentKey(
   return {
     ...baseCreds,
     access: data.api_key,
-    enterpriseUrl: safeBaseUrl(
-      data.inference_base_url || baseCreds.enterpriseUrl,
-    ),
+    enterpriseUrl: safeBaseUrl(data.inference_base_url || baseCreds.enterpriseUrl),
     metadata: {
       ...baseCreds.metadata,
       refreshToken: getRefreshToken(baseCreds),
@@ -681,9 +613,7 @@ async function mintAgentKey(
   };
 }
 
-async function loginNous(
-  callbacks: OAuthLoginCallbacks,
-): Promise<OAuthCredentials> {
+async function loginNous(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
   try {
     const device = await requestDeviceCode();
 
@@ -695,8 +625,7 @@ async function loginNous(
     });
 
     const token = await pollForToken(device, callbacks.signal);
-    if (!token.access_token)
-      throw new Error('Nous login did not return an access token');
+    if (!token.access_token) throw new Error('Nous login did not return an access token');
 
     const oauthExpiresAt = nowMs() + (token.expires_in || 3600) * 1000;
     const credentials: NousCredentials = {
@@ -724,8 +653,7 @@ async function loginNous(
       },
     };
   } catch (error) {
-    if (!(error instanceof Error) || error.message !== 'NOUS_VERCEL_CHECKPOINT')
-      throw error;
+    if (!(error instanceof Error) || error.message !== 'NOUS_VERCEL_CHECKPOINT') throw error;
 
     callbacks.onAuth({ url: `${NOUS_PORTAL_URL}/login` });
     const pasted = await callbacks.onPrompt({
