@@ -18,5 +18,5 @@ For example, choose a Nous model in pi, sign in through the device-flow prompt, 
 
 ```bash
 npm install
-npm run typecheck
+npm run check
 ```
