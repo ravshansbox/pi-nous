@@ -472,7 +472,7 @@ async function pollForToken(
     });
 
     const text = await response.text();
-    let data: NousTokenResponse | null = null;
+    let data: NousTokenResponse | null;
     try {
       data = text ? (JSON.parse(text) as NousTokenResponse) : null;
     } catch {
@@ -662,7 +662,7 @@ async function loginNous(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentia
     });
 
     const token = pasted.trim();
-    if (!token) throw new Error('No token provided');
+    if (!token) throw new Error('No token provided', { cause: error });
 
     if (token.startsWith('sk-')) {
       return {
