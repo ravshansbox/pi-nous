@@ -296,7 +296,6 @@ function supportsTextInput(live?: NousModelListItem): boolean {
   }
   const inputs = live?.modalities?.input || live?.architecture?.input_modalities;
   if (Array.isArray(inputs)) return inputs.includes('text');
-  // Fallback: most text models have "text" capability
   const id = live?.id?.toLowerCase() || '';
   return !/(image-only|vision-only|audio-only)/.test(id);
 }
@@ -309,16 +308,13 @@ function supportsTextOutput(live?: NousModelListItem): boolean {
   }
   const outputs = live?.modalities?.output || live?.architecture?.output_modalities;
   if (Array.isArray(outputs)) return outputs.includes('text');
-  // Fallback: text output is universal for LLMs
   return true;
 }
 
 function supportsToolCalling(live?: NousModelListItem): boolean {
-  // Check explicit supported_parameters first
   if (Array.isArray(live?.supported_parameters) && live.supported_parameters.includes('tools')) {
     return true;
   }
-  // Fallback: infer tool support from model ID for known capable model families
   const id = live?.id?.toLowerCase() || '';
   return /^(openai\/gpt-|anthropic\/claude|google\/gemini|x-ai\/grok|qwen|stepfun|minimax|z-ai\/|xiaomi\/mimo|nvidia\/|moonshotai|arcee-ai)/.test(
     id,
