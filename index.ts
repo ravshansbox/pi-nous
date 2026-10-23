@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { Api, Model, OAuthCredentials, OAuthLoginCallbacks } from '@earendil-works/pi-ai';
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { getAgentDir, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
 
 const NOUS_PORTAL_URL = 'https://portal.nousresearch.com';
 const NOUS_INFERENCE_URL = 'https://inference-api.nousresearch.com/v1';
@@ -233,7 +234,7 @@ async function fetchAccountInfo(accessToken: string): Promise<{
 
 async function loadPersistedNousCredentials(): Promise<NousCredentials | undefined> {
   try {
-    const raw = await readFile(`${process.env['HOME']}/.pi/agent/auth.json`, 'utf8');
+    const raw = await readFile(join(getAgentDir(), 'auth.json'), 'utf8');
     const parsed = JSON.parse(raw) as { nous?: NousCredentials };
     if (!parsed.nous || parsed.nous['type'] !== 'oauth') return undefined;
     return parsed.nous;
