@@ -740,4 +740,96 @@ export default async function (pi: ExtensionAPI) {
       },
     },
   });
+
+  pi.registerCommand('nous-debug', {
+    description:
+      'Probe the Nous API: resolve credentials, fetch /v1/models and /api/oauth/account, report auth plus entitlement',
+    handler: async (_args, ctx) => {
+      const out: string[] = [];
+      const ok = (s: string) => out.push(`  ok   ${s}`);
+      const bad = (s: string) => out.push(`  failed ${s}`);
+
+      let apiKey: string | undefined;
+      if (process.env['NOUS_API_KEY']) {
+        apiKey = process.env['NOUS_API_KEY'].trim();
+        ok('NOUS_API_KEY env is set');
+      } else {
+        const creds = await loadPersistedNousCredentials();
+        if (!creds || !creds.access) {
+          bad('no Nous credentials found (set NOUS_API_KEY or run a Nous login first)');
+          return;
+        }
+        apiKey = creds.access;
+        ok('agent key loaded from ~/.pi/agent/auth.json');
+      }
+
+      let oauthToken: string | undefined;
+      const creds = await loadPersistedNousCredentials();
+      if (creds?.metadata?.oauthAccessToken) {
+        oauthToken = creds.metadata.oauthAccessToken;
+        ok('OAuth token loaded from ~/.pi/agent/auth.json');
+      } else {
+        bad('no OAuth token in ~/.pi/agent/auth.json');
+      }
+
+      ok('models endpoint: GET ' + NOUS_INFERENCE_URL + '/models');
+      let modelsOk = false;
+      try {
+        const res = await fetch(NOUS_INFERENCE_URL + '/models', { headers: authHeaders(apiKey) });
+        const payload = (await res.json()) as { data?: { id?: string }[]; error?: string };
+        if (res.ok) {
+          modelsOk = true;
+          const ids = (payload.data ?? [])
+            .map((m) => m.id ?? '')
+            .filter(Boolean)
+            .slice(0, 5);
+          ok(
+            `HTTP ${res.status}; ${payload.data?.length ?? 0} model(s); first ids: ${ids.join(' ')}`,
+          );
+        } else {
+          bad(`HTTP ${res.status}; error: ${(payload.error as string) ?? 'unknown'}`);
+        }
+      } catch (e) {
+        bad(`request failed: ${(e as Error).message}`);
+      }
+
+      if (oauthToken) {
+        ok('account endpoint: GET ' + NOUS_PORTAL_URL + '/api/oauth/account');
+        try {
+          const res = await fetch(NOUS_PORTAL_URL + '/api/oauth/account', {
+            headers: authHeaders(oauthToken),
+          });
+          const body = (await res.json()) as Record<string, unknown>;
+          if (res.ok) {
+            ok(`HTTP ${res.status}; subscription=${JSON.stringify(body['subscription'])}`);
+            const credits = body['purchased_credits_remaining'];
+            ok(`purchased_credits_remaining=${typeof credits === 'number' ? credits : 'n/a'}`);
+            const toolAccess = body['tool_access'] as Record<string, unknown> | undefined;
+            ok(`tool_access.enabled=${toolAccess?.['enabled'] ?? 'n/a'}`);
+            const paid = body['paid_service_access'] as Record<string, unknown> | undefined;
+            ok(`paid_service_access.allowed=${paid?.['allowed'] ?? 'n/a'}`);
+            if (!paid?.['allowed'])
+              ok('no credits on account -> inference API calls will be blocked');
+          } else {
+            bad(`HTTP ${res.status}; body=${JSON.stringify(body)}`);
+          }
+        } catch (e) {
+          bad(`request failed: ${(e as Error).message}`);
+        }
+      } else {
+        bad('skipped account endpoint (no OAuth token)');
+      }
+
+      ctx.ui.notify(
+        out.length
+          ? [
+              'Nous API debug',
+              ...out,
+              modelsOk ? 'live model list fetched' : 'fallback used / endpoint unreachable',
+            ].join('\n')
+          : 'nothing to report',
+        'info',
+      );
+    },
+  });
 }
