@@ -410,9 +410,18 @@ function parseNousJson<T>(text: string, context: string): T {
 // Log all HTTP response bodies and JWT payloads during the OAuth flow.
 // Set DEBUG_NOUS=1 in the environment to enable.
 
+const DEBUG_LOGS: string[] = [];
+
 function debugLog(...args: unknown[]): void {
   if (process.env['DEBUG_NOUS'] === '1') {
-    console.warn('[NOUS-DEBUG]', ...args);
+    const entry = args
+      .map((a) => {
+        if (typeof a === 'string') return a;
+        return String(a);
+      })
+      .join(' ');
+    DEBUG_LOGS.push(entry);
+    console.warn('[NOUS-DEBUG]', entry);
   }
 }
 
@@ -803,7 +812,10 @@ export default async function (pi: ExtensionAPI) {
 
       ctx.ui.notify('Nous API diagnostics', 'info');
 
-      let apiKey = process.env['NOUS_API_KEY']?.trim();
+      // Debug logs from a previous login (with DEBUG_NOUS=1) persist in DEBUG_LOGS.
+      // They are displayed below if DEBUG_LOGS.length > 0.
+
+      let apiKey: string | undefined = process.env['NOUS_API_KEY']?.trim();
       if (apiKey) {
         ok('NOUS_API_KEY env is set');
       } else {
@@ -879,6 +891,21 @@ export default async function (pi: ExtensionAPI) {
       const failedCount = out.filter((l) => l.startsWith('  failed')).length;
       const passed = failedCount === 0;
       summary(passed, failedCount);
+
+      // Append accumulated debug logs (if DEBUG_NOUS=1 was set during a previous login)
+      if (DEBUG_LOGS.length > 0) {
+        out.push('');
+        out.push('--- debug logging (DEBUG_NOUS=1) ---');
+        out.push(...DEBUG_LOGS);
+        out.push('--- end debug logging ---');
+      } else {
+        out.push('');
+        out.push('--- debug logging ---');
+        out.push(
+          'No debug logs accumulated. Run the login with DEBUG_NOUS=1 to capture debug output.',
+        );
+        out.push('--- end debug logging ---');
+      }
 
       ctx.ui.notify(out.join('\n'), passed ? 'info' : 'error');
     },
