@@ -6,9 +6,8 @@ import { getAgentDir, type ExtensionAPI } from '@earendil-works/pi-coding-agent'
 const NOUS_PORTAL_URL = 'https://portal.nousresearch.com';
 const NOUS_INFERENCE_URL = 'https://inference-api.nousresearch.com/v1';
 const NOUS_CLIENT_ID = 'hermes-cli';
-const NOUS_SCOPE = 'inference:invoke';
+const NOUS_SCOPE = 'inference:mint_agent_key';
 const ACCESS_REFRESH_SKEW_MS = 2 * 60 * 1000;
-const AGENT_KEY_MIN_TTL_SECONDS = 30 * 60;
 const DEVICE_POLL_INTERVAL_CAP_MS = 1000;
 const BROWSER_LIKE_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
@@ -77,15 +76,6 @@ type NousDeviceCodeResponse = {
   verification_uri_complete?: string;
   expires_in: number;
   interval?: number;
-};
-
-type NousAgentKeyResponse = {
-  api_key: string;
-  key_id?: string;
-  expires_at?: string;
-  expires_in?: number;
-  reused?: boolean;
-  inference_base_url?: string;
 };
 
 type NousModelListItem = {
@@ -212,26 +202,6 @@ function getJwtExpMs(token: string): number | undefined {
   if (!payload?.['exp']) return undefined;
   const exp = payload['exp'] as number;
   return exp * 1000;
-}
-
-function isJwtUsable(token: string, scope: string, expiresAtMs?: number): boolean {
-  const payload = decodeJwtPayload(token);
-  if (!payload) return false;
-  const payloadScope = payload['scope'] as string | undefined;
-  const scopes = Array.isArray(payloadScope)
-    ? payloadScope
-    : String(payloadScope || '').split(/[,\s]+/);
-  const hasScope = scopes.includes(scope);
-  const expMs = typeof payload['exp'] === 'number' ? payload['exp'] * 1000 : undefined;
-  if (!hasScope) return false;
-  if (
-    expiresAtMs !== undefined &&
-    expMs !== undefined &&
-    expMs <= expiresAtMs + AGENT_KEY_MIN_TTL_SECONDS * 1000
-  ) {
-    return false;
-  }
-  return true;
 }
 
 function isModelFree(model: { cost?: { input?: number; output?: number } }): boolean {
@@ -436,6 +406,16 @@ function parseNousJson<T>(text: string, context: string): T {
   }
 }
 
+// ── Debug helpers ──
+// Log all HTTP response bodies and JWT payloads during the OAuth flow.
+// Set DEBUG_NOUS=1 in the environment to enable.
+
+function debugLog(...args: unknown[]): void {
+  if (process.env['DEBUG_NOUS'] === '1') {
+    console.warn('[NOUS-DEBUG]', ...args);
+  }
+}
+
 async function requestDeviceCode(): Promise<NousDeviceCodeResponse> {
   const response = await fetch(`${NOUS_PORTAL_URL}/api/oauth/device/code`, {
     method: 'POST',
@@ -521,9 +501,18 @@ async function pollForToken(
       data = null;
     }
 
-    if (response.ok && data?.access_token) return data;
+    if (response.ok && data?.access_token) {
+      debugLog(
+        `[pollForToken] user_code=${device.user_code} HTTP ${response.status} got access_token`,
+      );
+      return data;
+    }
 
     const error = data?.error;
+    debugLog(
+      `[pollForToken] user_code=${device.user_code} HTTP ${response.status} error=${error} body=${text.substring(0, 200)}`,
+    );
+
     if (error === 'authorization_pending') {
       await sleep(intervalMs, signal);
       continue;
@@ -548,8 +537,12 @@ async function pollForToken(
 
 async function refreshAccessToken(credentials: OAuthCredentials): Promise<NousCredentials> {
   const refreshToken = getRefreshToken(credentials);
-  if (!refreshToken) throw new Error('No Nous refresh token available');
+  if (!refreshToken) {
+    debugLog('[refreshAccessToken] NO refresh token available');
+    throw new Error('No Nous refresh token available');
+  }
 
+  debugLog('[refreshAccessToken] starting token refresh');
   const response = await fetch(`${NOUS_PORTAL_URL}/api/oauth/token`, {
     method: 'POST',
     headers: {
@@ -566,6 +559,8 @@ async function refreshAccessToken(credentials: OAuthCredentials): Promise<NousCr
   });
 
   const text = await response.text();
+  debugLog(`[refreshAccessToken] HTTP ${response.status} body=${text.substring(0, 300)}`);
+
   if (!response.ok) {
     throw new Error(`Nous token refresh failed: ${response.status} ${text}`);
   }
@@ -596,6 +591,7 @@ async function refreshAccessToken(credentials: OAuthCredentials): Promise<NousCr
 async function mintAgentKey(credentials: OAuthCredentials): Promise<NousCredentials> {
   let baseCreds = credentials as NousCredentials;
   if (isExpiring(credentials.expires, ACCESS_REFRESH_SKEW_MS)) {
+    debugLog('[mintAgentKey] token expiring, refreshing');
     baseCreds = await refreshAccessToken(credentials);
   }
 
@@ -603,13 +599,13 @@ async function mintAgentKey(credentials: OAuthCredentials): Promise<NousCredenti
   if (!accessToken) throw new Error('No access token available for agent key minting');
 
   // The Portal's access_token IS the invoke JWT (nous_jwt_mining.md).
-  // Validate scope=inference:invoke, exp, and minimum TTL before using.
-  const scope = getScope(baseCreds);
+  // The Portal has retired the /api/oauth/agent-key minting endpoint (HTTP 410).
+  // The access_token is stored directly as agent_key — no separate mint needed.
   const existingKey = getAgentKey(baseCreds);
   const existingKeyExpiry = getAgentKeyExpiryMs(baseCreds);
-  const expiresAtMs = baseCreds.expires;
 
   if (existingKey && existingKeyExpiry && !isExpiring(existingKeyExpiry ?? undefined, 60 * 1000)) {
+    debugLog('[mintAgentKey] using existing cached key');
     return {
       ...baseCreds,
       access: existingKey,
@@ -628,46 +624,11 @@ async function mintAgentKey(credentials: OAuthCredentials): Promise<NousCredenti
     };
   }
 
-  if (!isJwtUsable(accessToken, scope, expiresAtMs)) {
-    // Access token fails validation; try to mint a new invoke JWT via the Portal.
-    const response = await fetch(`${NOUS_PORTAL_URL}/api/oauth/agent-key`, {
-      method: 'POST',
-      headers: {
-        ...authHeaders(accessToken),
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ min_ttl_seconds: AGENT_KEY_MIN_TTL_SECONDS }),
-    });
+  debugLog('[mintAgentKey] access_token directly = agent_key (no minting endpoint)');
+  debugLog('[mintAgentKey] access_token: ' + accessToken.substring(0, 100) + '...');
+  debugLog('[mintAgentKey] scope: ' + getScope(baseCreds));
+  debugLog('[mintAgentKey] expires: ' + baseCreds.expires);
 
-    const text = await response.text();
-    if (!response.ok) {
-      throw new Error(`Nous agent key mint failed: ${response.status} ${text}`);
-    }
-
-    const data = parseNousJson<NousAgentKeyResponse>(text, 'agent key mint');
-    if (!data.api_key) {
-      throw new Error('Nous agent key response missing api_key');
-    }
-
-    return {
-      ...baseCreds,
-      access: data.api_key,
-      enterpriseUrl: safeBaseUrl(data.inference_base_url || baseCreds.enterpriseUrl),
-      metadata: {
-        ...baseCreds.metadata,
-        refreshToken: getRefreshToken(baseCreds),
-        tokenType: getTokenType(baseCreds),
-        scope: getScope(baseCreds),
-        oauthAccessToken: getOAuthAccessToken(baseCreds),
-        oauthAccessExpiresAt: baseCreds.expires,
-        agentKey: data.api_key,
-        agentKeyExpiresAt: data.expires_at,
-        keyId: data.key_id,
-      },
-    };
-  }
-
-  // access_token is a valid invoke JWT — use it directly as the agent key.
   return {
     ...baseCreds,
     access: accessToken,
@@ -715,8 +676,18 @@ async function loginNous(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentia
       },
     };
 
+    // Debug: log the raw JWT payload
+    debugLog('[loginNous] raw access_token: ' + token.access_token.substring(0, 100) + '...');
+    const payload = decodeJwtPayload(token.access_token);
+    debugLog('[loginNous] JWT payload: ' + JSON.stringify(payload));
+    debugLog('[loginNous] NOUS_SCOPE=' + NOUS_SCOPE);
+
     const minted = await mintAgentKey(credentials);
     const annotated = await annotateFreeTier(minted);
+    debugLog(
+      '[loginNous] final credentials.agentKey: ' +
+        (annotated as NousCredentials).metadata?.agentKey?.substring(0, 100),
+    );
     return {
       ...annotated,
       metadata: {
