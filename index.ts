@@ -6,7 +6,7 @@ import { getAgentDir, type ExtensionAPI } from '@earendil-works/pi-coding-agent'
 const NOUS_PORTAL_URL = 'https://portal.nousresearch.com';
 const NOUS_INFERENCE_URL = 'https://inference-api.nousresearch.com/v1';
 const NOUS_CLIENT_ID = 'hermes-cli';
-const NOUS_SCOPE = 'inference:mint_agent_key';
+const NOUS_SCOPE = 'inference:invoke';
 const ACCESS_REFRESH_SKEW_MS = 2 * 60 * 1000;
 const AGENT_KEY_MIN_TTL_SECONDS = 30 * 60;
 const DEVICE_POLL_INTERVAL_CAP_MS = 1000;
@@ -187,6 +187,51 @@ function getAgentKey(credentials: OAuthCredentials): string {
 function getAgentKeyExpiryMs(credentials: OAuthCredentials): number | undefined {
   const c = credentials as NousCredentials;
   return parseIsoToMs(c.metadata?.agentKeyExpiresAt);
+}
+
+// ── JWT minting helpers (per nous_jwt_mining.md) ──
+// The Portal's access_token IS the invoke JWT — no separate agent-key endpoint.
+// Validate: exp claim + scope claim + minimum TTL before accepting as usable.
+
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const base64 = parts[1] ?? '';
+    const json = Buffer.from(base64.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString(
+      'utf8',
+    );
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function getJwtExpMs(token: string): number | undefined {
+  const payload = decodeJwtPayload(token);
+  if (!payload?.['exp']) return undefined;
+  const exp = payload['exp'] as number;
+  return exp * 1000;
+}
+
+function isJwtUsable(token: string, scope: string, expiresAtMs?: number): boolean {
+  const payload = decodeJwtPayload(token);
+  if (!payload) return false;
+  const payloadScope = payload['scope'] as string | undefined;
+  const scopes = Array.isArray(payloadScope)
+    ? payloadScope
+    : String(payloadScope || '').split(/[,\s]+/);
+  const hasScope = scopes.includes(scope);
+  const expMs = typeof payload['exp'] === 'number' ? payload['exp'] * 1000 : undefined;
+  if (!hasScope) return false;
+  if (
+    expiresAtMs !== undefined &&
+    expMs !== undefined &&
+    expMs <= expiresAtMs + AGENT_KEY_MIN_TTL_SECONDS * 1000
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function isModelFree(model: { cost?: { input?: number; output?: number } }): boolean {
@@ -554,9 +599,17 @@ async function mintAgentKey(credentials: OAuthCredentials): Promise<NousCredenti
     baseCreds = await refreshAccessToken(credentials);
   }
 
+  const accessToken = getOAuthAccessToken(baseCreds) || baseCreds.access;
+  if (!accessToken) throw new Error('No access token available for agent key minting');
+
+  // The Portal's access_token IS the invoke JWT (nous_jwt_mining.md).
+  // Validate scope=inference:invoke, exp, and minimum TTL before using.
+  const scope = getScope(baseCreds);
   const existingKey = getAgentKey(baseCreds);
   const existingKeyExpiry = getAgentKeyExpiryMs(baseCreds);
-  if (existingKey && existingKeyExpiry && !isExpiring(existingKeyExpiry, 60 * 1000)) {
+  const expiresAtMs = baseCreds.expires;
+
+  if (existingKey && existingKeyExpiry && !isExpiring(existingKeyExpiry ?? undefined, 60 * 1000)) {
     return {
       ...baseCreds,
       access: existingKey,
@@ -569,33 +622,56 @@ async function mintAgentKey(credentials: OAuthCredentials): Promise<NousCredenti
         oauthAccessToken: getOAuthAccessToken(baseCreds),
         oauthAccessExpiresAt: baseCreds.expires,
         agentKey: existingKey,
+        agentKeyExpiresAt: existingKeyExpiry ? existingKeyExpiry.toString() : undefined,
+        keyId: baseCreds.metadata?.keyId,
       },
     };
   }
 
-  const response = await fetch(`${NOUS_PORTAL_URL}/api/oauth/agent-key`, {
-    method: 'POST',
-    headers: {
-      ...authHeaders(baseCreds.access),
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ min_ttl_seconds: AGENT_KEY_MIN_TTL_SECONDS }),
-  });
+  if (!isJwtUsable(accessToken, scope, expiresAtMs)) {
+    // Access token fails validation; try to mint a new invoke JWT via the Portal.
+    const response = await fetch(`${NOUS_PORTAL_URL}/api/oauth/agent-key`, {
+      method: 'POST',
+      headers: {
+        ...authHeaders(accessToken),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ min_ttl_seconds: AGENT_KEY_MIN_TTL_SECONDS }),
+    });
 
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(`Nous agent key mint failed: ${response.status} ${text}`);
+    const text = await response.text();
+    if (!response.ok) {
+      throw new Error(`Nous agent key mint failed: ${response.status} ${text}`);
+    }
+
+    const data = parseNousJson<NousAgentKeyResponse>(text, 'agent key mint');
+    if (!data.api_key) {
+      throw new Error('Nous agent key response missing api_key');
+    }
+
+    return {
+      ...baseCreds,
+      access: data.api_key,
+      enterpriseUrl: safeBaseUrl(data.inference_base_url || baseCreds.enterpriseUrl),
+      metadata: {
+        ...baseCreds.metadata,
+        refreshToken: getRefreshToken(baseCreds),
+        tokenType: getTokenType(baseCreds),
+        scope: getScope(baseCreds),
+        oauthAccessToken: getOAuthAccessToken(baseCreds),
+        oauthAccessExpiresAt: baseCreds.expires,
+        agentKey: data.api_key,
+        agentKeyExpiresAt: data.expires_at,
+        keyId: data.key_id,
+      },
+    };
   }
 
-  const data = parseNousJson<NousAgentKeyResponse>(text, 'agent key mint');
-  if (!data.api_key) {
-    throw new Error('Nous agent key response missing api_key');
-  }
-
+  // access_token is a valid invoke JWT — use it directly as the agent key.
   return {
     ...baseCreds,
-    access: data.api_key,
-    enterpriseUrl: safeBaseUrl(data.inference_base_url || baseCreds.enterpriseUrl),
+    access: accessToken,
+    enterpriseUrl: safeBaseUrl(baseCreds.enterpriseUrl),
     metadata: {
       ...baseCreds.metadata,
       refreshToken: getRefreshToken(baseCreds),
@@ -603,9 +679,9 @@ async function mintAgentKey(credentials: OAuthCredentials): Promise<NousCredenti
       scope: getScope(baseCreds),
       oauthAccessToken: getOAuthAccessToken(baseCreds),
       oauthAccessExpiresAt: baseCreds.expires,
-      agentKey: data.api_key,
-      agentKeyExpiresAt: data.expires_at,
-      keyId: data.key_id,
+      agentKey: accessToken,
+      agentKeyExpiresAt: getJwtExpMs(accessToken)?.toString(),
+      keyId: baseCreds.metadata?.keyId,
     },
   };
 }
@@ -749,14 +825,23 @@ export default async function (pi: ExtensionAPI) {
       const ok = (s: string) => out.push(`  ok   ${s}`);
       const bad = (s: string) => out.push(`  failed ${s}`);
 
-      let apiKey: string | undefined;
-      if (process.env['NOUS_API_KEY']) {
-        apiKey = process.env['NOUS_API_KEY'].trim();
+      const start = (s: string) => out.push(`--- ${s} ---`);
+      const summary = (passed: boolean, failedCount: number) => {
+        out.push(`DIAGNOSTICS: ${passed ? 'PASS' : `FAIL (${failedCount} check(s) failed)`}`);
+      };
+
+      ctx.ui.notify('Nous API diagnostics', 'info');
+
+      let apiKey = process.env['NOUS_API_KEY']?.trim();
+      if (apiKey) {
         ok('NOUS_API_KEY env is set');
       } else {
+        start('Authentication');
         const creds = await loadPersistedNousCredentials();
         if (!creds || !creds.access) {
           bad('no Nous credentials found (set NOUS_API_KEY or run a Nous login first)');
+          summary(false, 1);
+          ctx.ui.notify(out.join('\n'), 'error');
           return;
         }
         apiKey = creds.access;
@@ -772,13 +857,12 @@ export default async function (pi: ExtensionAPI) {
         bad('no OAuth token in ~/.pi/agent/auth.json');
       }
 
+      start('Endpoints');
       ok('models endpoint: GET ' + NOUS_INFERENCE_URL + '/models');
-      let modelsOk = false;
       try {
         const res = await fetch(NOUS_INFERENCE_URL + '/models', { headers: authHeaders(apiKey) });
         const payload = (await res.json()) as { data?: { id?: string }[]; error?: string };
         if (res.ok) {
-          modelsOk = true;
           const ids = (payload.data ?? [])
             .map((m) => m.id ?? '')
             .filter(Boolean)
@@ -808,8 +892,9 @@ export default async function (pi: ExtensionAPI) {
             ok(`tool_access.enabled=${toolAccess?.['enabled'] ?? 'n/a'}`);
             const paid = body['paid_service_access'] as Record<string, unknown> | undefined;
             ok(`paid_service_access.allowed=${paid?.['allowed'] ?? 'n/a'}`);
-            if (!paid?.['allowed'])
+            if (!paid?.['allowed']) {
               ok('no credits on account -> inference API calls will be blocked');
+            }
           } else {
             bad(`HTTP ${res.status}; body=${JSON.stringify(body)}`);
           }
@@ -820,16 +905,11 @@ export default async function (pi: ExtensionAPI) {
         bad('skipped account endpoint (no OAuth token)');
       }
 
-      ctx.ui.notify(
-        out.length
-          ? [
-              'Nous API debug',
-              ...out,
-              modelsOk ? 'live model list fetched' : 'fallback used / endpoint unreachable',
-            ].join('\n')
-          : 'nothing to report',
-        'info',
-      );
+      const failedCount = out.filter((l) => l.startsWith('  failed')).length;
+      const passed = failedCount === 0;
+      summary(passed, failedCount);
+
+      ctx.ui.notify(out.join('\n'), passed ? 'info' : 'error');
     },
   });
 }
