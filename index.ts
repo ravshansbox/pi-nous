@@ -2,6 +2,14 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Api, Model, OAuthCredentials, OAuthLoginCallbacks } from '@earendil-works/pi-ai';
 import { getAgentDir, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
+import { stream as openaiCompletionsStream } from '@earendil-works/pi-ai/api/openai-completions';
+import type {
+  AssistantMessage,
+  AssistantMessageEventStream,
+  SimpleStreamOptions,
+  TranscriptContext,
+} from '@earendil-works/pi-ai';
 
 const NOUS_PORTAL_URL = 'https://portal.nousresearch.com';
 const NOUS_INFERENCE_URL = 'https://inference-api.nousresearch.com/v1';
@@ -406,6 +414,105 @@ function parseNousJson<T>(text: string, context: string): T {
   }
 }
 
+// ── Rate-limit handling ───────────────────────────────────────────────────
+// The Nous inference API answers 429 with a JSON body shaped like:
+//   { status: 429, message: string, reason: string, retry_after: number, alternates: string[] }
+// We surface the server-suggested alternates and retry delay to the user, and
+// return a non-retryable assistant error so the agent loop stops retrying the
+// same model and the user can switch models instead of hammering the server.
+
+interface RateLimitErrorBody {
+  status?: number;
+  message?: string;
+  reason?: string;
+  retry_after?: number | string;
+  alternates?: string[];
+}
+
+function isRateLimitedErrorMessage(errorMessage: string): boolean {
+  return /\b429\b|rate.?limit|rate_limited|too many requests|overloaded|at capacity|servers are currently busy|currently experiencing high demand/i.test(
+    errorMessage,
+  );
+}
+
+function parseRateLimitBody(errorMessage: string): RateLimitErrorBody | undefined {
+  const start = errorMessage.lastIndexOf('{');
+  if (start === -1) return undefined;
+  try {
+    return JSON.parse(errorMessage.slice(start)) as RateLimitErrorBody;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildRateLimitedAssistantMessage(
+  model: Model<Api>,
+  body: RateLimitErrorBody,
+): AssistantMessage {
+  const alternates =
+    body.alternates && body.alternates.length ? body.alternates : ['a different Nous model'];
+  const alternateText = alternates.join(', ');
+  const retryAfter = body.retry_after;
+  const retryText =
+    typeof retryAfter === 'number' ? ` Try again in ${retryAfter}s if you prefer.` : '';
+  const errorMessage = `Nous is refusing requests for this model due to a fair-use cap. Stop retrying; switch to ${alternateText}. Server alternates: ${alternateText}.${retryText}`;
+  return {
+    role: 'assistant',
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    stopReason: 'error',
+    errorMessage,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    timestamp: Date.now(),
+  };
+}
+
+function wrapOpenAIStream(
+  model: Model<Api>,
+  context: TranscriptContext,
+  options?: SimpleStreamOptions,
+): AssistantMessageEventStream {
+  const inner = openaiCompletionsStream(model as Model<'openai-completions'>, context, options);
+  const outer = createAssistantMessageEventStream();
+  let intercepted = false;
+
+  (async () => {
+    for await (const event of inner) {
+      if (intercepted) {
+        break;
+      }
+      if (
+        event.type === 'error' &&
+        event.reason === 'error' &&
+        event.error?.stopReason === 'error' &&
+        isRateLimitedErrorMessage(event.error?.errorMessage ?? '')
+      ) {
+        const errorMessage = event.error?.errorMessage;
+        if (errorMessage !== undefined) {
+          const rateLimit = parseRateLimitBody(errorMessage);
+          if (rateLimit) {
+            intercepted = true;
+            outer.end(buildRateLimitedAssistantMessage(model, rateLimit));
+            continue;
+          }
+        }
+      }
+      outer.push(event);
+    }
+  })();
+
+  return outer;
+}
+
 // ── Debug helpers ──
 // Log all HTTP response bodies and JWT payloads during the OAuth flow.
 // Set DEBUG_NOUS=1 in the environment to enable.
@@ -753,9 +860,10 @@ export default async function (pi: ExtensionAPI) {
     // Keep fallback models. Runtime OAuth flow is the primary path.
   }
 
-  pi.registerProvider('nous', {
+  void pi.registerProvider('nous', {
     baseUrl: NOUS_INFERENCE_URL,
     api: 'openai-completions',
+    streamSimple: wrapOpenAIStream,
     models: discoveredModels,
     oauth: {
       name: 'Nous Portal',
@@ -797,7 +905,32 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand('nous-debug', {
+  void pi.registerCommand('nous-switch-model', {
+    description: 'List available Nous models and switch to an alternate.',
+    handler: async (_args, ctx) => {
+      const creds = await loadPersistedNousCredentials();
+      if (!creds?.access) {
+        ctx.ui.notify('Nous login first (run /login or set NOUS_API_KEY).', 'error');
+        return;
+      }
+      const agentKey = creds.metadata?.agentKey || creds.access;
+      let models: NousModel[];
+      try {
+        models = await fetchLiveModels(agentKey, NOUS_INFERENCE_URL);
+      } catch (error) {
+        ctx.ui.notify(`Could not fetch Nous models: ${(error as Error).message}`, 'error');
+        return;
+      }
+      const ids = models.map((model) => model.id);
+      const index = await ctx.ui.select(`Nous models (${ids.length})`, ids);
+      if (index === undefined) return;
+      const chosenModel = models.find((model) => model.id === index);
+      if (chosenModel === undefined) return;
+      ctx.ui.notify(`Nous model: ${chosenModel.id}`, 'info');
+    },
+  });
+
+  void pi.registerCommand('nous-debug', {
     description:
       'Probe the Nous API: resolve credentials, fetch /v1/models and /api/oauth/account, report auth plus entitlement',
     handler: async (_args, ctx) => {
