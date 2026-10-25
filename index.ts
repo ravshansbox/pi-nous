@@ -932,21 +932,35 @@ export default async function (pi: ExtensionAPI) {
 
   void pi.registerCommand('nous-debug', {
     description:
-      'Probe the Nous API: resolve credentials, fetch /v1/models and /api/oauth/account, report auth plus entitlement',
-    handler: async (_args, ctx) => {
+      'Probe the Nous API: resolve credentials, fetch /v1/models and /api/oauth/account, report auth plus entitlement. With "on"/"off" enables/disables debug tracing.',
+    handler: async (args, ctx) => {
       const out: string[] = [];
       const ok = (s: string) => out.push(`  ok   ${s}`);
       const bad = (s: string) => out.push(`  failed ${s}`);
 
       const start = (s: string) => out.push(`--- ${s} ---`);
       const summary = (passed: boolean, failedCount: number) => {
-        out.push(`DIAGNOSTICS: ${passed ? 'PASS' : `FAIL (${failedCount} check(s) failed)`}`);
+        out.push(`DIAGNOSTICS: ${passed ? 'PASS' : `FAIL (\${failedCount} check(s) failed)`}`);
       };
 
-      ctx.ui.notify('Nous API diagnostics', 'info');
+      const trimmed = args.trim().toLowerCase();
 
-      // Debug logs from a previous login (with DEBUG_NOUS=1) persist in DEBUG_LOGS.
-      // They are displayed below if DEBUG_LOGS.length > 0.
+      // Control debug tracing
+      if (trimmed === 'on' || trimmed === 'enable' || trimmed === 'true') {
+        process.env['DEBUG_NOUS'] = '1';
+        DEBUG_LOGS.length = 0;
+        ctx.ui.notify('Nous debug tracing enabled', 'info');
+        return;
+      }
+      if (trimmed === 'off' || trimmed === 'disable' || trimmed === 'false') {
+        delete process.env['DEBUG_NOUS'];
+        DEBUG_LOGS.length = 0;
+        ctx.ui.notify('Nous debug tracing disabled', 'info');
+        return;
+      }
+
+      // Show Nous API diagnostics
+      ctx.ui.notify('Nous API diagnostics', 'info');
 
       let apiKey: string | undefined = process.env['NOUS_API_KEY']?.trim();
       if (apiKey) {
@@ -990,7 +1004,7 @@ export default async function (pi: ExtensionAPI) {
           bad(`HTTP ${res.status}; error: ${(payload.error as string) ?? 'unknown'}`);
         }
       } catch (e) {
-        bad(`request failed: ${(e as Error).message}`);
+        bad(`request failed: \$(e as Error).message`);
       }
 
       if (oauthToken) {
@@ -1012,10 +1026,10 @@ export default async function (pi: ExtensionAPI) {
               ok('no credits on account -> inference API calls will be blocked');
             }
           } else {
-            bad(`HTTP ${res.status}; body=${JSON.stringify(body)}`);
+            bad(`HTTP ${res.status}; body=\${JSON.stringify(body)}`);
           }
         } catch (e) {
-          bad(`request failed: ${(e as Error).message}`);
+          bad(`request failed: \$(e as Error).message`);
         }
       } else {
         bad('skipped account endpoint (no OAuth token)');
