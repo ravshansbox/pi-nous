@@ -13,6 +13,7 @@ import type {
 
 const NOUS_PORTAL_URL = 'https://portal.nousresearch.com';
 const NOUS_INFERENCE_URL = 'https://inference-api.nousresearch.com/v1';
+let autoSwitchEnabled: boolean | undefined;
 const NOUS_CLIENT_ID = 'hermes-cli';
 const NOUS_SCOPE = 'inference:mint_agent_key';
 const ACCESS_REFRESH_SKEW_MS = 2 * 60 * 1000;
@@ -476,6 +477,40 @@ function buildRateLimitedAssistantMessage(
   };
 }
 
+function buildModelForAlternate(id: string): Model<'openai-completions'> {
+  const m = modelMeta(id);
+  return {
+    id,
+    name: m.name,
+    api: 'openai-completions',
+    provider: 'nous',
+    baseUrl: NOUS_INFERENCE_URL,
+    input: m.input,
+    cost: m.cost,
+    reasoning: m.reasoning,
+    contextWindow: m.contextWindow,
+    maxTokens: m.maxTokens,
+    compat: m.compat,
+  } as Model<'openai-completions'>;
+}
+
+function pickFreeAlternates(
+  alternates: string[] | undefined,
+  currentModelId: string,
+): Model<'openai-completions'>[] {
+  const list = alternates && alternates.length ? alternates : ['a different Nous model'];
+  const freeAlternates: Model<'openai-completions'>[] = [];
+  for (const alt of list) {
+    if (typeof alt === 'string' && alt.endsWith(':free')) {
+      const altId = alt.replace(/:free$/i, '');
+      if (altId.toLowerCase() !== currentModelId.toLowerCase()) {
+        freeAlternates.push(buildModelForAlternate(alt));
+      }
+    }
+  }
+  return freeAlternates;
+}
+
 function wrapOpenAIStream(
   model: Model<Api>,
   context: TranscriptContext,
@@ -500,6 +535,19 @@ function wrapOpenAIStream(
         if (errorMessage !== undefined) {
           const rateLimit = parseRateLimitBody(errorMessage);
           if (rateLimit) {
+            if (autoSwitchEnabled === true) {
+              const currentModelId = model.id;
+              const freeAlternates = pickFreeAlternates(rateLimit.alternates, currentModelId);
+              if (freeAlternates.length > 0) {
+                const alternate = freeAlternates[0]!;
+                intercepted = true;
+                const newStream = openaiCompletionsStream(alternate, context, options);
+                for await (const newEvent of newStream) {
+                  outer.push(newEvent);
+                }
+                return;
+              }
+            }
             intercepted = true;
             outer.end(buildRateLimitedAssistantMessage(model, rateLimit));
             continue;
@@ -904,6 +952,15 @@ export default async function (pi: ExtensionAPI) {
       },
     },
   });
+
+  pi.registerFlag('nous-auto-switch', {
+    description:
+      'Automatically switch to a free alternate model when the current model hits a fair-use cap (429).',
+    type: 'boolean',
+    default: false,
+  });
+
+  autoSwitchEnabled = pi.getFlag('nous-auto-switch') === true;
 
   void pi.registerCommand('nous-switch-model', {
     description: 'List available Nous models and switch to an alternate.',
